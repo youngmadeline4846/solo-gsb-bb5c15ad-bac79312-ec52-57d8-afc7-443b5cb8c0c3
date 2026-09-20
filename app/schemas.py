@@ -79,6 +79,33 @@ class PropagationRequest(BaseModel):
     )
 
 
+class TargetUncertainty(BaseModel):
+    """带单位的目标合成标准不确定度；dimensionless 时可省略单位。"""
+
+    value: NonNegFiniteFloat = Field(..., description="目标合成标准不确定度，非负有限实数")
+    unit: str | None = Field(
+        default=None,
+        description="目标不确定度单位，须与公式结果量纲一致；缺省视为无量纲",
+    )
+
+
+class AllocateUncertaintyRequest(PropagationRequest):
+    """不确定度分配请求：在现有输入量中指定一个待分配输入及目标合成标准不确定度。
+
+    待分配输入自带的 standard_uncertainty 会被忽略（视为未知量）。
+    """
+
+    allocate_input: str = Field(
+        ...,
+        min_length=1,
+        description="待分配不确定度的输入量名称（须出现在 inputs 中）",
+    )
+    target_combined_standard_uncertainty: TargetUncertainty = Field(
+        ...,
+        description="目标合成标准不确定度（带单位）",
+    )
+
+
 class CorrelationTerm(BaseModel):
     """与另一输入量 j 的协方差对 i 的不确定度贡献项。"""
 
@@ -120,3 +147,39 @@ class PropagationResponse(BaseModel):
     total_variance_unit: str
     formula: str
     whitelist: list[str]
+
+
+class FeasibleRange(BaseModel):
+    """待分配输入标准不确定度的可行区间（以其自身单位表示）。"""
+
+    lower: float = Field(..., description="可行区间下界（非负）")
+    upper: float = Field(..., description="可行区间上界；即返回的最大标准不确定度")
+    unit: str
+
+
+class AllocationResult(BaseModel):
+    """分配结果：满足目标的最大非负标准不确定度及代回后的合成值。"""
+
+    input: str = Field(..., description="待分配输入量名称")
+    standard_uncertainty: float = Field(
+        ..., description="满足目标的最大非负标准不确定度（以该输入自身单位表示）"
+    )
+    unit: str = Field(..., description="分配得到的不确定度单位（与该输入数值单位一致）")
+    achieved_combined_standard_uncertainty: float = Field(
+        ..., description="把分配值代回公式后的合成标准不确定度（以结果单位表示）"
+    )
+    target_combined_standard_uncertainty: float = Field(
+        ..., description="目标合成标准不确定度（换算到结果单位后的数值）"
+    )
+    combined_unit: str = Field(..., description="合成标准不确定度（结果）的单位")
+    feasible_range: FeasibleRange = Field(
+        ..., description="标准不确定度可行区间；上界即分配结果"
+    )
+
+
+class AllocationResponse(BaseModel):
+    result: AllocationResult
+    number_of_inputs: int = Field(..., description="参与传播的输入量数量")
+    correlation_matrix: list[list[float]]
+    sensitivity_coefficients: list[SensitivityCoefficient]
+    formula: str

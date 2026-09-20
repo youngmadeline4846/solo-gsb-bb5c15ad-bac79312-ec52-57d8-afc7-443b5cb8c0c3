@@ -325,4 +325,186 @@ show("20) pi*E, no x dependence (uc=0)", r.json())
 assert r.status_code == 200, r.text
 assert abs(r.json()["result"]["standard_uncertainty"]) < 1e-12
 
+# === POST /api/v1/allocate-uncertainty ====================================
+
+ALLOC = "/api/v1/allocate-uncertainty"
+
+
+def alloc_body(**overrides):
+    body = {
+        "inputs": [
+            {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+            {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.02},
+        ],
+        "formula": "U*I",
+        "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+        "allocate_input": "U",
+        "target_combined_standard_uncertainty": {"value": 0.5, "unit": "W"},
+    }
+    body.update(overrides)
+    return body
+
+
+# 21) 基本分配：目标 uc=0.5 W，相关项完整保留
+#    V(z)=4z^2+0.4z+0.04 <= 0.25 -> z = (-0.4+sqrt(3.52))/8
+r = client.post(ALLOC, json=alloc_body())
+show("21) allocate U, target uc=0.5 W (expect z=0.18452 V)", r.json())
+assert r.status_code == 200, r.text
+b = r.json()["result"]
+assert abs(b["standard_uncertainty"] - ((-0.4 + 3.52 ** 0.5) / 8)) < 1e-12
+assert b["unit"] == "V"
+assert b["combined_unit"] == "W"
+assert abs(b["achieved_combined_standard_uncertainty"] - 0.5) < 1e-9
+assert b["feasible_range"]["lower"] == 0.0
+assert abs(b["feasible_range"]["upper"] - b["standard_uncertainty"]) < 1e-12
+# 待分配输入自带的 standard_uncertainty 被忽略
+r2 = client.post(ALLOC, json=alloc_body(inputs=[
+    {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 999.0},
+    {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.02},
+]))
+assert r2.status_code == 200
+assert abs(r2.json()["result"]["standard_uncertainty"] - b["standard_uncertainty"]) < 1e-12
+
+# 22) 与 /propagate 交叉验证：代回分配值后合成值达标，且再大即超标
+z = b["standard_uncertainty"]
+rp = client.post("/api/v1/propagate", json={
+    "inputs": [
+        {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": z},
+        {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.02},
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+})
+assert abs(rp.json()["result"]["standard_uncertainty"] - 0.5) < 1e-9
+rp2 = client.post("/api/v1/propagate", json={
+    "inputs": [
+        {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": z * 1.001 + 1e-9},
+        {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.02},
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+})
+assert rp2.json()["result"]["standard_uncertainty"] > 0.5
+
+# 23) 完全负相关 + 目标 0：可行区间退化为单点 z=0.1 V
+r = client.post(ALLOC, json=alloc_body(
+    correlation_matrix=[[1.0, -1.0], [-1.0, 1.0]],
+    target_combined_standard_uncertainty={"value": 0.0, "unit": "W"},
+))
+show("23) r=-1, target 0 (single feasible z=0.1 V)", r.json())
+assert r.status_code == 200
+b = r.json()["result"]
+assert abs(b["standard_uncertainty"] - 0.1) < 1e-12
+assert abs(b["feasible_range"]["lower"] - 0.1) < 1e-12
+assert abs(b["feasible_range"]["upper"] - 0.1) < 1e-12
+assert b["achieved_combined_standard_uncertainty"] < 1e-12
+
+# 24) 完全负相关形成有上下界的区间：f=x+y, u_y=0.5, V=(z-0.5)^2, target=sqrt(0.1)
+r = client.post(ALLOC, json={
+    "inputs": [
+        {"name": "x", "value": 1, "unit": "m", "standard_uncertainty": 0.1},
+        {"name": "y", "value": 2, "unit": "m", "standard_uncertainty": 0.5},
+    ],
+    "formula": "x+y",
+    "correlation_matrix": [[1.0, -1.0], [-1.0, 1.0]],
+    "allocate_input": "x",
+    "target_combined_standard_uncertainty": {"value": 0.1 ** 0.5, "unit": "m"},
+})
+show("24) bounded feasible interval via r=-1", r.json())
+assert r.status_code == 200
+b = r.json()["result"]
+assert abs(b["standard_uncertainty"] - (0.5 + 0.1 ** 0.5)) < 1e-12
+assert abs(b["feasible_range"]["lower"] - (0.5 - 0.1 ** 0.5)) < 1e-12
+
+# 25) 目标不可达：其余输入量自身贡献（uc=1 W）已超目标 0.5 W
+r = client.post(ALLOC, json=alloc_body(inputs=[
+    {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+    {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.1},
+]))
+show("25) target unreachable -> 422 target_unreachable", r.json())
+assert r.status_code == 422
+e = r.json()["error"]
+assert e["code"] == "target_unreachable"
+assert e["loc"] == ["target_combined_standard_uncertainty"]
+
+# 26) 灵敏度为零（公式不含待分配输入）：无有限上界 -> 422 zero_sensitivity
+r = client.post(ALLOC, json=alloc_body(formula="I*2",
+                                       target_combined_standard_uncertainty={"value": 0.1, "unit": "A"}))
+show("26) zero sensitivity / unbounded -> 422 zero_sensitivity", r.json())
+assert r.status_code == 422
+e = r.json()["error"]
+assert e["code"] == "zero_sensitivity"
+assert e["loc"] == ["allocate_input"]
+
+# 27) 灵敏度为零且其余贡献已超目标，同样 422
+r = client.post(ALLOC, json=alloc_body(formula="I*2",
+                                       target_combined_standard_uncertainty={"value": 0.01, "unit": "A"}))
+assert r.status_code == 422 and r.json()["error"]["code"] == "zero_sensitivity"
+
+# 28) 待分配输入未声明 -> 422 unknown_input
+r = client.post(ALLOC, json=alloc_body(allocate_input="P"))
+show("28) unknown allocate_input -> 422", r.json())
+assert r.status_code == 422
+e = r.json()["error"]
+assert e["code"] == "unknown_input" and e["loc"] == ["allocate_input"]
+
+# 29) 目标单位量纲与结果不一致 -> 422，定位到 unit
+r = client.post(ALLOC, json=alloc_body(
+    target_combined_standard_uncertainty={"value": 0.5, "unit": "A"}))
+show("29) target unit A vs result W -> 422", r.json())
+assert r.status_code == 422
+e = r.json()["error"]
+assert e["code"] == "incompatible_unit"
+assert e["loc"] == ["target_combined_standard_uncertainty", "unit"]
+
+# 30) 目标单位自动换算：f=x（m），目标 2000 mm -> z=2 m
+r = client.post(ALLOC, json={
+    "inputs": [{"name": "x", "value": 5, "unit": "m", "standard_uncertainty": 0.1}],
+    "formula": "x",
+    "allocate_input": "x",
+    "target_combined_standard_uncertainty": {"value": 2000, "unit": "mm"},
+})
+show("30) target 2000 mm -> z=2 m", r.json())
+assert r.status_code == 200
+b = r.json()["result"]
+assert abs(b["standard_uncertainty"] - 2.0) < 1e-12 and b["unit"] == "m"
+assert abs(b["target_combined_standard_uncertainty"] - 2.0) < 1e-12
+
+# 31) 无量纲目标可省略单位
+r = client.post(ALLOC, json={
+    "inputs": [{"name": "x", "value": 2.0, "unit": "dimensionless",
+                "standard_uncertainty": 0.1}],
+    "formula": "x^2",
+    "allocate_input": "x",
+    "target_combined_standard_uncertainty": {"value": 0.4},
+})
+show("31) dimensionless target without unit (z=0.1)", r.json())
+assert r.status_code == 200
+assert abs(r.json()["result"]["standard_uncertainty"] - 0.1) < 1e-12
+
+# 32) 复用相关矩阵校验：非对称矩阵
+r = client.post(ALLOC, json=alloc_body(
+    inputs=[
+        {"name": "x", "value": 1, "unit": "m", "standard_uncertainty": 0.1},
+        {"name": "y", "value": 2, "unit": "m", "standard_uncertainty": 0.1},
+    ],
+    formula="x+y",
+    correlation_matrix=[[1.0, 0.5], [0.3, 1.0]],
+    target_combined_standard_uncertainty={"value": 1.0, "unit": "m"},
+))
+show("32) asymmetric matrix -> 422", r.json())
+assert r.status_code == 422 and r.json()["error"]["code"] == "asymmetric_matrix"
+
+# 33) 复用公式量纲校验
+r = client.post(ALLOC, json=alloc_body(formula="U + I",
+                                       target_combined_standard_uncertainty={"value": 1, "unit": "V"}))
+assert r.status_code == 422 and r.json()["error"]["code"] == "dimension_mismatch"
+
+# 34) 目标为负数 -> 422（请求体校验，带 loc）
+r = client.post(ALLOC, json=alloc_body(
+    target_combined_standard_uncertainty={"value": -0.5, "unit": "W"}))
+show("34) negative target -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["loc"][0] == "target_combined_standard_uncertainty"
+
 print("\nALL TESTS PASSED")

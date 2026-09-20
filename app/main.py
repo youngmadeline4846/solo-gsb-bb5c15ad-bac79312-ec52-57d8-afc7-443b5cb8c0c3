@@ -6,8 +6,14 @@ from fastapi.exceptions import RequestValidationError
 
 from .errors import UnprocessableError, request_validation_handler, unprocessable_handler
 from .formula import WHITELIST_DISPLAY
+from .allocation import allocate
 from .propagation import propagate
-from .schemas import PropagationRequest, PropagationResponse
+from .schemas import (
+    AllocateUncertaintyRequest,
+    AllocationResponse,
+    PropagationRequest,
+    PropagationResponse,
+)
 
 app = FastAPI(
     title="校准计算不确定度传播 API",
@@ -55,3 +61,29 @@ _EXAMPLE = {
 def calculate(req: PropagationRequest) -> dict:
     """执行一次不确定度传播计算。"""
     return propagate(req)
+
+
+_ALLOCATE_EXAMPLE = {
+    "inputs": [
+        {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+        {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.02},
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+    "allocate_input": "U",
+    "target_combined_standard_uncertainty": {"value": 0.5, "unit": "W"},
+}
+
+
+@app.post(
+    "/api/v1/allocate-uncertainty",
+    response_model=AllocationResponse,
+    tags=["uncertainty"],
+    responses={422: {"description": "目标不可达 / 灵敏度为零 / 无有限上界 / 单位量纲不兼容等"}},
+    openapi_extra={
+        "examples": {"为 U 分配最大允许不确定度（目标 uc=0.5 W）": {"value": _ALLOCATE_EXAMPLE}},
+    },
+)
+def allocate_uncertainty(req: AllocateUncertaintyRequest) -> dict:
+    """不确定度分配：反解待分配输入满足目标合成标准不确定度的最大非负标准不确定度。"""
+    return allocate(req)

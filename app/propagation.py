@@ -71,6 +71,7 @@ def _prepare_inputs(req) -> list[dict]:
         prepared.append(
             {
                 "name": item.name,
+                "index": index,
                 "symbol": sp.Symbol(item.name),
                 "value": q,
                 "magnitude": float(item.value),
@@ -82,8 +83,12 @@ def _prepare_inputs(req) -> list[dict]:
     return prepared
 
 
-def propagate(req) -> dict:
-    """执行完整传播计算，返回可直接序列化的结果字典。"""
+def evaluate_model(req) -> dict:
+    """执行与不确定度取值无关的模型计算，供传播与分配接口共用。
+
+    返回：输入量内部表示、相关系数矩阵、公式表达式、结果值/显示单位、
+    各输入量灵敏度系数（数值与单位）以及 cu_i = c_i u_i（以结果显示单位计）。
+    """
     inputs = _prepare_inputs(req)
     n = len(inputs)
 
@@ -110,8 +115,9 @@ def propagate(req) -> dict:
     result_value = convert_magnitude(result_q, display_unit, ["formula"])
     result_q = Quantity(result_value, display_unit)
 
-    # 符号偏导并在输入估计值处求值。
+    # 符号偏导并在输入估计值处取值。
     sensitivities: list[dict] = []
+    c_mags: list[float] = []  # c_i，数值以“结果单位/输入单位”表示
     cu_mags: list[float] = []  # c_i u_i，统一用结果单位表示的数值
     for p in inputs:
         derivative = sp.diff(expr, p["symbol"])
@@ -131,6 +137,7 @@ def propagate(req) -> dict:
                 ["formula"],
                 code="evaluation_error",
             )
+        c_mags.append(c_mag)
         cu_mags.append(c_mag * p["u_magnitude"])
         sensitivities.append(
             {
@@ -140,8 +147,21 @@ def propagate(req) -> dict:
             }
         )
 
-    # 协方差矩阵传播：C_y = c_u^T R c_u（数值以结果单位计）。
-    cu = cu_mags
+    return {
+        "inputs": inputs,
+        "n": n,
+        "corr": corr,
+        "expr": expr,
+        "result_q": result_q,
+        "display_unit": display_unit,
+        "sensitivities": sensitivities,
+        "c_mags": c_mags,
+        "cu_mags": cu_mags,
+    }
+
+
+def _variance_from_cu(cu: list[float], corr, n: int) -> tuple[float, list[list[float]]]:
+    """协方差矩阵传播：C_y = c_u^T R c_u（数值以结果单位计）。"""
     variance_matrix = [[cu[i] * corr[i, j] * cu[j] for j in range(n)] for i in range(n)]
     total_variance = sum(sum(row) for row in variance_matrix)
     if total_variance < 0 and total_variance > -1e-12:
@@ -152,6 +172,21 @@ def propagate(req) -> dict:
             ["correlation_matrix"],
             code="not_positive_semidefinite",
         )
+    return total_variance, variance_matrix
+
+
+def propagate(req) -> dict:
+    """执行完整传播计算，返回可直接序列化的结果字典。"""
+    model = evaluate_model(req)
+    inputs = model["inputs"]
+    n = model["n"]
+    corr = model["corr"]
+    result_q = model["result_q"]
+    display_unit = model["display_unit"]
+    sensitivities = model["sensitivities"]
+    cu = model["cu_mags"]
+
+    total_variance, variance_matrix = _variance_from_cu(cu, corr, n)
     uc = math.sqrt(total_variance)
 
     # 按输入量分解方差贡献：
