@@ -22,6 +22,35 @@ class UncertaintySpec(BaseModel):
     unit: str | None = Field(default=None, description="不确定度单位；缺省视为无量纲")
 
 
+def _coerce_uncertainty(value: Any) -> Any:
+    """校验并规整 standard_uncertainty 的原始 JSON 取值。"""
+    if _is_real_number(value):
+        if value < 0:
+            raise PydanticCustomError(
+                "non_negative",
+                "标准不确定度必须为非负数，得到 {value}",
+                {"value": value},
+            )
+        return float(value)
+    if isinstance(value, dict):
+        # 在此校验数值，避免落入联合分支产生 'float' 之类的定位尾巴。
+        num = value.get("value")
+        if not _is_real_number(num) or num < 0:
+            raise PydanticCustomError(
+                "non_negative",
+                "不确定度 value 必须为非负有限实数",
+            )
+        value = {**value, "value": float(num)}
+        unit = value.get("unit")
+        if unit is not None and not isinstance(unit, str):
+            raise PydanticCustomError("invalid_unit", "不确定度 unit 必须为字符串")
+        return value
+    raise PydanticCustomError(
+        "invalid_uncertainty",
+        "standard_uncertainty 必须是非负数值或 {{value, unit}} 对象",
+    )
+
+
 class InputQuantity(BaseModel):
     """一个输入量：数值、单位、标准不确定度。"""
 
@@ -43,31 +72,23 @@ class InputQuantity(BaseModel):
     @classmethod
     def _validate_uncertainty_shape(cls, value: Any) -> Any:
         """按原始 JSON 类型分流，避免智能联合把标量胁迫为对象。"""
-        if _is_real_number(value):
-            if value < 0:
-                raise PydanticCustomError(
-                    "non_negative",
-                    "标准不确定度必须为非负数，得到 {value}",
-                    {"value": value},
-                )
-            return float(value)
-        if isinstance(value, dict):
-            # 在此校验数值，避免落入联合分支产生 'float' 之类的定位尾巴。
-            num = value.get("value")
-            if not _is_real_number(num) or num < 0:
-                raise PydanticCustomError(
-                    "non_negative",
-                    "不确定度 value 必须为非负有限实数",
-                )
-            value = {**value, "value": float(num)}
-            unit = value.get("unit")
-            if unit is not None and not isinstance(unit, str):
-                raise PydanticCustomError("invalid_unit", "不确定度 unit 必须为字符串")
-            return value
-        raise PydanticCustomError(
-            "invalid_uncertainty",
-            "standard_uncertainty 必须是非负数值或 {{value, unit}} 对象",
-        )
+        return _coerce_uncertainty(value)
+
+
+class AllocationInputQuantity(InputQuantity):
+    """不确定度分配请求中的输入量；待分配输入量可省略自身不确定度。"""
+
+    standard_uncertainty: float | UncertaintySpec | None = Field(
+        default=None,
+        description="待分配输入量可省略（其不确定度是待求未知量）；其余输入量必须给出",
+    )
+
+    @field_validator("standard_uncertainty", mode="before")
+    @classmethod
+    def _validate_uncertainty_shape(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return _coerce_uncertainty(value)
 
 
 class PropagationRequest(BaseModel):
@@ -76,6 +97,41 @@ class PropagationRequest(BaseModel):
     correlation_matrix: list[list[FiniteFloat]] | None = Field(
         default=None,
         description="输入量相关系数矩阵，顺序与 inputs 一致；缺省为单位阵（互不相关）",
+    )
+
+
+class TargetUncertainty(BaseModel):
+    """带单位的目标合成标准不确定度。"""
+
+    value: NonNegFiniteFloat
+    unit: str = Field(..., min_length=1, description="目标合成标准不确定度的单位，须与模型输出同量纲")
+
+
+class TargetUncertaintyEcho(BaseModel):
+    """回显请求中指定的目标合成标准不确定度。"""
+
+    value: float
+    unit: str
+
+
+class AllocationRequest(BaseModel):
+    """不确定度逆分配请求：把 allocate_input 的标准不确定度视为未知量。"""
+
+    inputs: list[AllocationInputQuantity] = Field(..., min_length=1)
+    formula: str = Field(..., min_length=1, description="仅含白名单运算的测量公式")
+    correlation_matrix: list[list[FiniteFloat]] | None = Field(
+        default=None,
+        description="输入量相关系数矩阵，顺序与 inputs 一致；缺省为单位阵（互不相关）",
+    )
+    allocate_input: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="待分配标准不确定度的输入量名称（须在 inputs 中声明）",
+    )
+    target_combined_uncertainty: TargetUncertainty = Field(
+        ...,
+        description="目标合成标准不确定度（带单位，须与公式输出同量纲）",
     )
 
 
@@ -120,3 +176,31 @@ class PropagationResponse(BaseModel):
     total_variance_unit: str
     formula: str
     whitelist: list[str]
+
+
+class VarianceQuadraticCoefficients(BaseModel):
+    """总方差关于未知标准不确定度 u 的二次式 Var(u) = a u^2 + b u + c。"""
+
+    a: float = Field(..., description="二次项系数（=c_k^2，矩阵对角元恒为 1，故 a>0）")
+    a_unit: str
+    b: float = Field(..., description="一次项系数（含全部相关项）")
+    b_unit: str
+    c: float = Field(..., description="常数项（其余输入量在未知量取 0 时的总方差）")
+    c_unit: str
+    unknown_uncertainty_unit: str = Field(
+        ..., description="未知标准不确定度 u 的单位（即待分配输入量自身单位）"
+    )
+
+
+class AllocationResponse(PropagationResponse):
+    """不确定度逆分配结果：代回求得的最大不确定度后，结构与传播响应一致并附分配信息。"""
+
+    allocate_input: str = Field(..., description="被分配标准不确定度的输入量名称")
+    allocated_standard_uncertainty: float = Field(
+        ..., description="满足目标的最大非负标准不确定度，单位与该输入量声明单位一致"
+    )
+    allocated_standard_uncertainty_unit: str
+    target_combined_uncertainty: TargetUncertaintyEcho = Field(
+        ..., description="回显目标合成标准不确定度（值/单位）"
+    )
+    variance_quadratic: VarianceQuadraticCoefficients

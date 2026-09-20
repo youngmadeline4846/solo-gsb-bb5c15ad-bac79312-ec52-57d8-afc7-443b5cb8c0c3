@@ -6,6 +6,10 @@
           + 2 Σ_{i<j} c_i c_j u(x_i) u(x_j) r(x_i, x_j)
 
 其中 c_i = ∂f/∂x_i 在输入估计值处取值。
+
+``propagate`` 直接给出合成结果；``evaluate_model`` /
+``variance_from_cu`` 供不确定度逆分配（allocation）复用同一条公式、
+同一套单位与相关矩阵校验。
 """
 from __future__ import annotations
 
@@ -25,9 +29,20 @@ from .units import (
     unit_str,
 )
 
+WHITELIST = [
+    "+", "-", "*", "/", "** (^)",
+    "sqrt", "exp", "log", "ln", "log10", "log2",
+    "sin", "cos", "tan", "asin", "acos", "atan", "abs",
+    "pi", "E",
+]
 
-def _prepare_inputs(req) -> list[dict]:
-    """解析每个输入量的单位与不确定度，返回内部表示列表。"""
+
+def _prepare_inputs(req, allow_missing_uncertainty: bool = False) -> list[dict]:
+    """解析每个输入量的单位与不确定度，返回内部表示列表。
+
+    ``allow_missing_uncertainty=True`` 时（逆分配请求），允许不确定度缺省，
+    对应项 ``u_magnitude`` 为 ``None``，由调用方决定其取值。
+    """
     seen: set[str] = set()
     prepared: list[dict] = []
 
@@ -49,7 +64,16 @@ def _prepare_inputs(req) -> list[dict]:
         q = Quantity(float(item.value), unit)
 
         su = item.standard_uncertainty
-        if isinstance(su, (int, float)):
+        if su is None:
+            if not allow_missing_uncertainty:
+                # 常规传播请求中 schema 已保证非空；此处仅作防御。
+                raise UnprocessableError(
+                    f"输入量 {item.name!r} 缺少标准不确定度",
+                    loc + ["standard_uncertainty"],
+                    code="missing_uncertainty",
+                )
+            u_mag = None
+        elif isinstance(su, (int, float)):
             u_mag, u_unit = float(su), unit
         else:
             if su.unit is None:
@@ -82,15 +106,15 @@ def _prepare_inputs(req) -> list[dict]:
     return prepared
 
 
-def propagate(req) -> dict:
-    """执行完整传播计算，返回可直接序列化的结果字典。"""
-    inputs = _prepare_inputs(req)
-    n = len(inputs)
+def evaluate_model(inputs: list[dict], formula: str) -> dict:
+    """复用全部既有校验，求解模型值、单位与各输入量的灵敏度系数。
 
-    corr = validate_correlation_matrix(req.correlation_matrix, n)
-
+    返回字典包含：result_q（结果带单位量）、display_unit、
+    sensitivities（[{input,value,unit}]）与 c_mags（与 inputs 同序的灵敏度
+    数值，以结果单位/输入单位表示）。相关矩阵的校验在调用前完成。
+    """
     names = {p["name"] for p in inputs}
-    expr = parse_formula(req.formula, names)
+    expr = parse_formula(formula, names)
 
     # 量纲静态校验。
     symbol_dims = {p["symbol"]: p["unit"].dimensionality for p in inputs}
@@ -112,14 +136,13 @@ def propagate(req) -> dict:
 
     # 符号偏导并在输入估计值处求值。
     sensitivities: list[dict] = []
-    cu_mags: list[float] = []  # c_i u_i，统一用结果单位表示的数值
+    c_mags: list[float] = []
     for p in inputs:
         derivative = sp.diff(expr, p["symbol"])
         deriv_q = evaluate(derivative, quantities)
         # c_i 单位 = 结果单位 / 输入单位（量纲已由静态校验保证）。
         deriv_unit = result_q.units / p["unit"]
-        zero_magnitude = float(deriv_q.magnitude) == 0.0
-        if zero_magnitude:
+        if float(deriv_q.magnitude) == 0.0:
             # 偏导恒为零（输入量未出现在公式中）：零可带任意单位。
             c_mag = 0.0
         else:
@@ -131,7 +154,7 @@ def propagate(req) -> dict:
                 ["formula"],
                 code="evaluation_error",
             )
-        cu_mags.append(c_mag * p["u_magnitude"])
+        c_mags.append(c_mag)
         sensitivities.append(
             {
                 "input": p["name"],
@@ -140,8 +163,17 @@ def propagate(req) -> dict:
             }
         )
 
-    # 协方差矩阵传播：C_y = c_u^T R c_u（数值以结果单位计）。
-    cu = cu_mags
+    return {
+        "result_q": result_q,
+        "display_unit": display_unit,
+        "sensitivities": sensitivities,
+        "c_mags": c_mags,
+    }
+
+
+def variance_from_cu(cu: list[float], corr) -> tuple[float, list[list[float]]]:
+    """协方差矩阵传播：C_y = c_u^T R c_u，返回（总方差, 逐元素矩阵）。"""
+    n = len(cu)
     variance_matrix = [[cu[i] * corr[i, j] * cu[j] for j in range(n)] for i in range(n)]
     total_variance = sum(sum(row) for row in variance_matrix)
     if total_variance < 0 and total_variance > -1e-12:
@@ -152,26 +184,31 @@ def propagate(req) -> dict:
             ["correlation_matrix"],
             code="not_positive_semidefinite",
         )
-    uc = math.sqrt(total_variance)
+    return total_variance, variance_matrix
 
-    # 按输入量分解方差贡献：
-    #   对角项 u_i^2 = (c_i u_i)^2；
-    #   交叉项 2 c_i c_j u_i u_j r_ij 在 i、j 上各分摊一半，
-    #   因而各输入量贡献之和恰为总方差。
-    contributions: list[dict] = []
-    shares = [cu[i] * cu[i] for i in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
+
+def _build_contributions(
+    inputs: list[dict],
+    cu: list[float],
+    corr,
+    variance_matrix: list[list[float]],
+    total_variance: float,
+    variance_display_unit: str,
+) -> list[dict]:
+    """按输入量分解方差贡献：u_i^2 对角项 + 相关项在 i、j 上分摊一半。"""
+    shares = [cu[i] * cu[i] for i in range(len(inputs))]
+    for i in range(len(inputs)):
+        for j in range(i + 1, len(inputs)):
             pair = 2.0 * variance_matrix[i][j]
             if abs(pair) < 1e-300:
                 pair = 0.0
             shares[i] += pair / 2.0
             shares[j] += pair / 2.0
 
-    variance_display_unit = unit_str(display_unit ** 2)
+    contributions: list[dict] = []
     for i, p in enumerate(inputs):
         corr_terms = []
-        for j in range(n):
+        for j in range(len(inputs)):
             if i == j:
                 continue
             pair = 2.0 * variance_matrix[i][j]
@@ -195,6 +232,27 @@ def propagate(req) -> dict:
                 "correlation_terms": corr_terms,
             }
         )
+    return contributions
+
+
+def propagate(req) -> dict:
+    """执行完整传播计算，返回可直接序列化的结果字典。"""
+    inputs = _prepare_inputs(req)
+    n = len(inputs)
+
+    corr = validate_correlation_matrix(req.correlation_matrix, n)
+    model = evaluate_model(inputs, req.formula)
+    result_q = model["result_q"]
+    display_unit = model["display_unit"]
+
+    cu = [model["c_mags"][i] * inputs[i]["u_magnitude"] for i in range(n)]
+    total_variance, variance_matrix = variance_from_cu(cu, corr)
+    uc = math.sqrt(total_variance)
+
+    variance_display_unit = unit_str(display_unit ** 2)
+    contributions = _build_contributions(
+        inputs, cu, corr, variance_matrix, total_variance, variance_display_unit
+    )
 
     return {
         "result": {
@@ -204,15 +262,10 @@ def propagate(req) -> dict:
         },
         "number_of_inputs": n,
         "correlation_matrix": [[float(x) for x in row] for row in corr],
-        "sensitivity_coefficients": sensitivities,
+        "sensitivity_coefficients": model["sensitivities"],
         "variance_contributions": contributions,
         "total_variance": total_variance,
         "total_variance_unit": variance_display_unit,
         "formula": req.formula,
-        "whitelist": [
-            "+", "-", "*", "/", "** (^)",
-            "sqrt", "exp", "log", "ln", "log10", "log2",
-            "sin", "cos", "tan", "asin", "acos", "atan", "abs",
-            "pi", "E",
-        ],
+        "whitelist": list(WHITELIST),
     }
